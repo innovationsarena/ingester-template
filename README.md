@@ -1,82 +1,91 @@
 # ingester-template
 
-Welcome to your new [Mastra](https://mastra.ai) project! We're excited to see what you build.
+Fastify + TypeScript boilerplate for receiving webhooks on `POST /webhooks/:hook_id`.
 
-This starter provides you with a general-purpose Mastra agent that can research current information, manage multi-step tasks, work with local files, run approved shell commands, and create recurring schedules.
+## Setup
 
-## Features
-
-- A project-level `workspace/` for files and command execution
-- Approval gates for file changes, deletions, and shell commands
-- Conversation memory, generated thread titles, and task tracking
-- Built-in web search and direct web page fetching
-- Recurring schedules that persist across restarts
-- Local libSQL storage and DuckDB observability, with optional Turso storage
-- A bundled Mastra skill that helps coding agents use current Mastra APIs
-
-## Get started
-
-Set your `OPENAI_API_KEY` in `.env` or in your environment, then run:
-
-```shell
+```bash
+npm install
+cp .env.example .env
 npm run dev
 ```
 
-Open [http://localhost:4111](http://localhost:4111) in your browser to access [Mastra Studio](https://mastra.ai/docs/studio/overview).
+## Routes
 
-Select **Agent** in Mastra Studio and try one of these prompts:
+| Method | Path                 | Notes                                              |
+| ------ | -------------------- | -------------------------------------------------- |
+| `POST` | `/webhooks/:hook_id` | Accepts a payload, returns `202` with the result   |
+| `GET`  | `/health`            | Liveness probe                                     |
 
-- `Get the weather forecast for Austin this weekend.`
-- `Create a landing page for a Japanese sakura festival.`
-- `Check the SPCX stock price now, then check it every minute.`
+`hook_id` is validated as `^[A-Za-z0-9_-]{1,128}$` — anything else gets `400`.
 
-The agent asks for approval before it changes files or runs commands. When it creates a schedule, it returns an ID that you can use to pause the schedule.
-
-## Workspace safety
-
-The local filesystem tools stay inside the project-level `workspace/` directory. Shell commands start in that directory, but `LocalSandbox` does not provide operating-system isolation by default. Review command approvals carefully, and do not expose this template through an unauthenticated public server.
-
-## Storage
-
-The default `file:./mastra.db` database stores agent memory, tasks, and schedules locally. To use Turso, set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in `.env`.
-
-Recurring schedules continue to use model tokens until you pause them. Ask the agent to pause a schedule with the ID returned by `start_schedule`.
-
-## Webhook-triggered ingest workflow
-
-`POST /webhooks/ingest` starts a run of `ingest-workflow`, which hands the event to an agent whose tools come from an MCP server.
-
-Set `MCP_SERVER_URL` (and `MCP_SERVER_TOKEN` if the server needs a bearer token) in `.env`, then:
-
-```shell
-curl -X POST http://localhost:4111/webhooks/ingest \
+```bash
+curl -i -X POST localhost:3000/webhooks/my-source \
   -H 'content-type: application/json' \
-  -H "x-webhook-secret: $WEBHOOK_SECRET" \
-  -d '{"source":"github","event":"issue.created","payload":{"number":42}}'
+  -d '{"hello":"world"}'
 ```
 
-The route replies `202` with a `runId` and continues the run in the background, because webhook senders retry on slow responses. Check the outcome in Studio's **Workflows** tab or with:
+## Where to add your code
 
-```shell
-curl http://localhost:4111/api/workflows/ingestWorkflow/runs/<runId>
+`src/ingest.ts` is the single entry point — every request to `/webhooks/:hook_id`
+lands in `ingest()` with the parsed body, the raw body string, headers and the
+hook id. Dispatch per source from there (queue publish, DB write, handler map).
+
+Keep it fast; the route replies `202` as soon as `ingest()` resolves, so hand
+slow work off to a queue instead of awaiting it inline.
+
+## Auth
+
+Set `WEBHOOK_SECRET` and the route requires a matching `x-webhook-secret` header
+(compared in constant time), otherwise `401`. Unset = no check, for local dev.
+
+For providers that sign the payload instead (Stripe, GitHub, Slack, …), compute
+the HMAC over `event.raw` in `ingest()` — `src/plugins/raw-body.ts` preserves the
+body byte-for-byte before parsing.
+
+## Docker
+
+```bash
+docker build -t ingester-template .
+docker run -p 3000:3000 -e WEBHOOK_SECRET=... ingester-template
 ```
 
-The route is intentionally public (`requiresAuth: false`). Set `WEBHOOK_SECRET` in `.env` to require a matching `X-Webhook-Secret` header — without it, anyone who can reach the URL can trigger runs and spend model tokens.
+Or with Compose (reads `.env` for `PORT`, `WEBHOOK_SECRET`, `LOG_LEVEL`, `BODY_LIMIT`):
 
-Without `MCP_SERVER_URL` the agent still runs, just with no tools; it reports `status: "skipped"` and logs a warning.
+```bash
+docker compose up --build -d
+docker compose logs -f
+```
 
-## Making it yours
+The image is a multi-stage build on `node:22-alpine`: dependencies install in a
+layer keyed on the lockfile, TypeScript compiles in a throwaway stage, and the
+final stage carries only `dist/` plus production `node_modules`. It runs as the
+unprivileged `node` user, defaults to `NODE_ENV=production` on `0.0.0.0:3000`,
+and has a `HEALTHCHECK` against `/health`.
 
-- Edit `src/mastra/agents/agent.ts` to change the model, instructions, memory, workspace, or approval policy.
-- Edit `src/mastra/tools/` to customize scheduling.
-- Edit `src/mastra/index.ts` to change storage and observability.
-- Edit `src/mastra/workflows/ingest-workflow.ts` to change the ingest event and result schemas, or `src/mastra/mcp/mcp-client.ts` to add more MCP servers.
-- Add files or reusable skills under `workspace/` for the agent to use.
+`node` runs as PID 1 — `src/server.ts` traps `SIGTERM`/`SIGINT` and closes the
+server, so `docker stop` drains in-flight requests instead of being killed after
+the grace period. Override the Node major with `--build-arg NODE_VERSION=24-alpine`.
 
-## Learn more
+## Layout
 
-To learn more about Mastra, visit our [documentation](https://mastra.ai/docs/). If you're new to AI agents, check out our [course](https://mastra.ai/learn) and [YouTube videos](https://youtube.com/@mastra-ai). You can also join our [Discord](https://discord.gg/BTYqqHKUrf) community to get help and share your projects.
+```
+src/
+  server.ts             # listen + graceful shutdown
+  app.ts                # Fastify instance, logging, error handling
+  config.ts             # env parsing
+  ingest.ts             # your handling logic
+  plugins/raw-body.ts   # raw body capture + catch-all content type parser
+  routes/
+    webhooks.ts         # POST /webhooks/:hook_id
+    health.ts           # GET /health
+Dockerfile              # multi-stage production image
+docker-compose.yml
+```
 
-## Deploy to the Mastra platform
+## Scripts
 
-The [Mastra platform](https://projects.mastra.ai) provides two products for deploying and managing AI applications built with the Mastra framework. Learn more in the [Mastra platform documentation](https://mastra.ai/docs/mastra-platform/overview).
+- `npm run dev` — watch mode
+- `npm run typecheck` — `tsc --noEmit`
+- `npm run build` — emit to `dist/`
+- `npm start` — run the build
