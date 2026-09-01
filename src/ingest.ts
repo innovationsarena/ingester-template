@@ -33,7 +33,7 @@ export async function ingest(
     "webhook received"
   );
 
-  log.info(event);
+  log.info(event, "event");
 
   return { accepted: true, hookId: event.hookId };
 }
