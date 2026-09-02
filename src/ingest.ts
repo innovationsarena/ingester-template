@@ -19,6 +19,15 @@ export interface IngestResult {
   [key: string]: unknown;
 }
 
+/** How much of each body to put in the info-level log line. */
+const PREVIEW_CHARS = 500;
+
+function preview(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (value.length <= PREVIEW_CHARS) return value;
+  return `${value.slice(0, PREVIEW_CHARS)}… (+${value.length - PREVIEW_CHARS} chars)`;
+}
+
 /**
  * Single entry point for everything that arrives on /webhooks/:hook_id.
  *
@@ -49,8 +58,8 @@ export async function ingest(
       from: email.from.map((a) => a.address),
       to: email.to.map((a) => a.address),
       subject: email.subject,
-      hasText: Boolean(email.text),
-      hasHtml: Boolean(email.html),
+      text: preview(email.text),
+      html: preview(email.html),
       attachments: email.attachments.map((a) => ({
         filename: a.filename,
         contentType: a.contentType,
@@ -58,6 +67,12 @@ export async function ingest(
       })),
     },
     "email parsed"
+  );
+
+  // Untruncated bodies — run with LOG_LEVEL=debug to see them in full.
+  log.debug(
+    { hookId: event.hookId, text: email.text, html: email.html },
+    "email bodies"
   );
 
   // TODO: this is where the message goes somewhere useful — store the bodies,

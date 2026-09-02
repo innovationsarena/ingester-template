@@ -62,8 +62,6 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
         request.log
       );
 
-      console.log(result);
-
       // 202: the payload is durably accepted, processing may continue async.
       return reply.code(202).send(result);
     }

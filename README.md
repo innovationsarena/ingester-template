@@ -55,6 +55,12 @@ email.headers;      // full header Map
 `attachment.content` is a decoded `Buffer`. Nothing is written to disk — upload
 it, store it, or forward it from `ingest()`.
 
+**Seeing the bodies.** The `email parsed` log line carries the first 500
+characters of `text` and `html`; `LOG_LEVEL=debug` adds an `email bodies` line
+with both in full. The HTTP response stays a small receipt (`messageId`,
+`subject`, attachment count) rather than echoing the message back — add
+`text: email.text` to the returned object in `ingest()` if you want it there.
+
 **Finding the message.** With `MAIL_FIELD` set, that dot path is used verbatim
 (`MAIL_FIELD=envelope.message.raw`). Unset, it probes common field names
 (`rawMime`, `raw_mime`, `rawEmail`, `raw_email`, `mime`, `raw`, `content`,
