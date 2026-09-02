@@ -1,5 +1,7 @@
 import type { FastifyBaseLogger } from "fastify";
 
+import { parseEmailFromWebhook } from "./mail.js";
+
 export interface WebhookEvent {
   /** The `:hook_id` path segment the payload arrived on. */
   hookId: string;
@@ -33,7 +35,41 @@ export async function ingest(
     "webhook received"
   );
 
-  log.info(event, "event");
+  const email = await parseEmailFromWebhook(event);
 
-  return { accepted: true, hookId: event.hookId };
+  if (!email) {
+    log.warn({ hookId: event.hookId }, "no MIME message found in payload");
+    return { accepted: true, hookId: event.hookId, parsed: false };
+  }
+
+  log.info(
+    {
+      hookId: event.hookId,
+      messageId: email.messageId,
+      from: email.from.map((a) => a.address),
+      to: email.to.map((a) => a.address),
+      subject: email.subject,
+      hasText: Boolean(email.text),
+      hasHtml: Boolean(email.html),
+      attachments: email.attachments.map((a) => ({
+        filename: a.filename,
+        contentType: a.contentType,
+        size: a.size,
+      })),
+    },
+    "email parsed"
+  );
+
+  // TODO: this is where the message goes somewhere useful — store the bodies,
+  // upload `attachment.content` to object storage, publish to a queue, ...
+  // `email.attachments[].content` holds the decoded bytes; nothing is persisted.
+
+  return {
+    accepted: true,
+    hookId: event.hookId,
+    parsed: true,
+    messageId: email.messageId,
+    subject: email.subject,
+    attachments: email.attachments.length,
+  };
 }

@@ -13,12 +13,20 @@ const paramsSchema = {
   required: ["hook_id"],
   properties: {
     // slug-ish: letters, digits, dash, underscore
-    hook_id: { type: "string", minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$" },
+    hook_id: {
+      type: "string",
+      minLength: 1,
+      maxLength: 128,
+      pattern: "^[A-Za-z0-9_-]+$",
+    },
   },
 } as const;
 
 /** Constant-time secret comparison, tolerant of missing/multi-value headers. */
-function secretMatches(provided: string | string[] | undefined, expected: string): boolean {
+function secretMatches(
+  provided: string | string[] | undefined,
+  expected: string
+): boolean {
   if (typeof provided !== "string") return false;
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
@@ -32,7 +40,12 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       schema: { params: paramsSchema },
       onRequest: async (request: FastifyRequest, reply) => {
         if (!config.webhookSecret) return;
-        if (!secretMatches(request.headers["x-webhook-secret"], config.webhookSecret)) {
+        if (
+          !secretMatches(
+            request.headers["x-webhook-secret"],
+            config.webhookSecret
+          )
+        ) {
           return reply.code(401).send({ error: "unauthorized" });
         }
       },
@@ -46,11 +59,13 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
           body: request.body,
           raw: request.rawBody ?? "",
         },
-        request.log,
+        request.log
       );
+
+      console.log(result);
 
       // 202: the payload is durably accepted, processing may continue async.
       return reply.code(202).send(result);
-    },
+    }
   );
 }

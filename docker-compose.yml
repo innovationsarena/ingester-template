@@ -10,6 +10,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       BODY_LIMIT: ${BODY_LIMIT:-1048576}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      MAIL_FIELD: ${MAIL_FIELD:-}
+      MAIL_ENCODING: ${MAIL_ENCODING:-auto}
     healthcheck:
       test:
         - CMD

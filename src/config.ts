@@ -5,6 +5,15 @@ const int = (value: string | undefined, fallback: number): number => {
   return parsed;
 };
 
+const MAIL_ENCODINGS = ["auto", "base64", "utf8"] as const;
+type MailEncoding = (typeof MAIL_ENCODINGS)[number];
+
+const mailEncoding = (value: string | undefined): MailEncoding => {
+  if (!value) return "auto";
+  if ((MAIL_ENCODINGS as readonly string[]).includes(value)) return value as MailEncoding;
+  throw new Error(`MAIL_ENCODING must be one of ${MAIL_ENCODINGS.join(", ")}, got "${value}"`);
+};
+
 export const config = {
   env: process.env.NODE_ENV ?? "development",
   host: process.env.HOST ?? "0.0.0.0",
@@ -14,6 +23,13 @@ export const config = {
   bodyLimit: int(process.env.BODY_LIMIT, 1_048_576),
   /** Shared secret used to authenticate incoming webhooks. Unset = no check. */
   webhookSecret: process.env.WEBHOOK_SECRET,
+  /**
+   * Where the raw MIME message sits in the JSON payload, as a dot path
+   * (e.g. `message.raw`). Unset = probe a list of common field names.
+   */
+  mailField: process.env.MAIL_FIELD,
+  /** How that field is encoded: `auto` sniffs base64 vs plain MIME. */
+  mailEncoding: mailEncoding(process.env.MAIL_ENCODING),
 } as const;
 
 export const isProduction = config.env === "production";
