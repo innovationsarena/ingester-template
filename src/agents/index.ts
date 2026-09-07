@@ -2,6 +2,7 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { Agent } from "@voltagent/core";
 
 import { config } from "../config.js";
+import { mcpTools } from "../mcp.js";
 
 /**
  * The provider's model-id union may lag behind released models; the string is
@@ -15,7 +16,8 @@ const model = anthropic(config.agentModel as Parameters<typeof anthropic>[0]);
  * store, which would drop a database file into a service that holds no state.
  */
 function defineAgent(name: string, instructions: string): Agent {
-  return new Agent({ name, instructions, model, memory: false });
+  // `tools` as a function defers the MCP connection to the first agent run.
+  return new Agent({ name, instructions, model, memory: false, tools: mcpTools });
 }
 
 const fallback = defineAgent("default", config.agentInstructions);

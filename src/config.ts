@@ -58,6 +58,14 @@ export const config = {
   /** Attachments larger than this are skipped, not converted. */
   maxAttachmentBytes: int(process.env.MAX_ATTACHMENT_BYTES, 26_214_400),
 
+  /**
+   * Streamable-HTTP MCP endpoint whose tools every agent gets. Set to empty to
+   * run without MCP tools.
+   */
+  mcpUrl: url(process.env.MCP_URL ?? "https://gr-mcp.innovationsarenan.se/mcp"),
+  /** Per-request timeout for MCP calls, tool listing included. */
+  mcpTimeoutMs: int(process.env.MCP_TIMEOUT_MS, 30_000),
+
   /** Model id passed to @ai-sdk/anthropic. */
   agentModel: process.env.AGENT_MODEL ?? "claude-opus-5",
   /** System prompt for the fallback agent. */

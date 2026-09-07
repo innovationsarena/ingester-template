@@ -59,7 +59,7 @@ PDF, DOCX/XLSX/PPTX, HTML, CSV, images and more, so there is no attachment type 
 pipeline has to refuse.
 
 - **One file per request** — `/v1/convert/source` returns a zip archive if handed
-  several `file_sources`, so attachments go through a small concurrency pool
+  several `sources`, so attachments go through a small concurrency pool
   (`DOCLING_CONCURRENCY`, default 2) instead.
 - **Failures are per-attachment.** A timeout, a `500`, an unreachable Docling, or a
   `200` carrying `status: "failure"` marks that one document as failed and notes it
@@ -135,6 +135,28 @@ VoltAgent 2.x accepts, and the mismatch shows up as a `LanguageModelV4` type err
 Agents are created with `memory: false` on purpose — VoltAgent otherwise provisions
 a local store, which would drop a database file into a service that holds no state.
 
+### MCP tools
+
+Every agent is handed the tools of the MCP server at `MCP_URL` (`src/mcp.ts`),
+default `https://gr-mcp.innovationsarenan.se/mcp` — a Graphiti knowledge-graph
+memory server, no auth. Tools arrive namespaced by the server key, so Graphiti's
+`search_nodes` reaches the model as `graphiti_search_nodes`.
+
+The connection is opened on the first agent run, not at startup, and the client
+is reused across emails. If the server is unreachable VoltAgent logs it and the
+agent runs with no tools, the same way an unreachable Docling degrades to a
+failed attachment. `MCP_URL=` disables MCP entirely.
+
+Two things worth knowing before pointing this at production traffic:
+
+- `graphiti_clear_graph`, `graphiti_delete_episode` and
+  `graphiti_delete_entity_edge` are destructive and reach an agent that runs
+  unattended on incoming mail. Restrict them with the `authorization.can` hook
+  in `MCPConfiguration` if that is not wanted.
+- Tool use costs steps. VoltAgent allows 5 per run by default, so a turn that
+  searches and then answers fits, but a long chain does not — raise `maxSteps`
+  on the `Agent` if agents start stopping mid-task.
+
 Without `ANTHROPIC_API_KEY` the pipeline still runs: attachments are converted and
 the assembled input is logged with `agent skipped`. That is the quickest way to see
 what the agent would receive.
@@ -184,6 +206,7 @@ src/
   docling.ts            # docling-serve client (one document per request)
   prompt.ts             # email + conversions → agent input
   jobs.ts               # background runner with drain-on-shutdown
+  mcp.ts                # MCP client: remote tools for the agents
   agents/index.ts       # VoltAgent agents, keyed by hook_id
   plugins/raw-body.ts   # raw body capture + catch-all content type parser
   routes/

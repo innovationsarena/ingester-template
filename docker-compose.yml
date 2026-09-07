@@ -18,6 +18,8 @@ services:
       DOCLING_API_KEY: ${DOCLING_API_KEY:-}
       DOCLING_TIMEOUT_MS: ${DOCLING_TIMEOUT_MS:-120000}
       MAX_ATTACHMENT_BYTES: ${MAX_ATTACHMENT_BYTES:-26214400}
+      MCP_URL: ${MCP_URL-https://gr-mcp.innovationsarenan.se/mcp}
+      MCP_TIMEOUT_MS: ${MCP_TIMEOUT_MS:-30000}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       AGENT_MODEL: ${AGENT_MODEL:-claude-opus-5}
     healthcheck:
