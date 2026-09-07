@@ -25,14 +25,50 @@ curl -i -X POST localhost:3000/webhooks/my-source \
   -d '{"hello":"world"}'
 ```
 
-## Where to add your code
+## The pipeline
 
-`src/ingest.ts` is the single entry point — every request to `/webhooks/:hook_id`
-lands in `ingest()` with the parsed body, the raw body string, headers and the
-hook id. Dispatch per source from there (queue publish, DB write, handler map).
+```
+POST /webhooks/:hook_id
+  → parse MIME
+  → dedupe on Message-ID
+  → 202 Accepted                      ← the request ends here, in ~40 ms
+       ↓  (background job)
+  → each attachment → Docling → Markdown
+  → assemble headers + body + attachment sections
+  → agent = agents[hook_id] ?? default
+  → agent.generateText(...)
+```
 
-Keep it fast; the route replies `202` as soon as `ingest()` resolves, so hand
-slow work off to a queue instead of awaiting it inline.
+Everything after the `202` runs in a background job (`src/jobs.ts`), so a slow OCR
+pass or a long agent turn can never cause a provider webhook timeout — and a
+`SIGTERM` waits for in-flight jobs instead of killing them mid-conversion.
+
+`src/ingest.ts` is the orchestrator; the steps live in `src/docling.ts`,
+`src/prompt.ts` and `src/agents/index.ts`.
+
+Duplicate deliveries are dropped on `Message-ID` (providers retry on any non-2xx
+and on timeouts), answering `202` with `duplicate: true` and running nothing. The
+set is per-process and resets on restart — the honest limit of a service that
+stores nothing.
+
+## Document conversion
+
+Every attachment goes to [docling-serve](https://github.com/docling-project/docling-serve)
+at `POST $DOCLING_URL/v1/convert/source` and comes back as Markdown. Docling reads
+PDF, DOCX/XLSX/PPTX, HTML, CSV, images and more, so there is no attachment type the
+pipeline has to refuse.
+
+- **One file per request** — `/v1/convert/source` returns a zip archive if handed
+  several `file_sources`, so attachments go through a small concurrency pool
+  (`DOCLING_CONCURRENCY`, default 2) instead.
+- **Failures are per-attachment.** A timeout, a `500`, an unreachable Docling, or a
+  `200` carrying `status: "failure"` marks that one document as failed and notes it
+  in the agent's input; the rest of the message still goes through. `5xx` and
+  timeouts get one retry.
+- **Oversized attachments** (`MAX_ATTACHMENT_BYTES`, default 25 MB) are skipped
+  without a Docling call and mentioned in the input.
+- **HTML-only messages** have their body converted too — Docling accepts HTML, which
+  beats sending raw markup to the model.
 
 ## Mail parsing
 
@@ -52,8 +88,8 @@ email.attachments;  // [{ filename, contentType, size, checksum, inline, content
 email.headers;      // full header Map
 ```
 
-`attachment.content` is a decoded `Buffer`. Nothing is written to disk — upload
-it, store it, or forward it from `ingest()`.
+`attachment.content` is a decoded `Buffer`, which is what gets handed to Docling.
+Nothing is written to disk at any point.
 
 **Seeing the bodies.** The `email parsed` log line carries the first 500
 characters of `text` and `html`; `LOG_LEVEL=debug` adds an `email bodies` line
@@ -76,8 +112,32 @@ Returns `undefined` when the payload holds no message — `ingest()` logs a
 warning and still answers `202`; change that to a `4xx` if a missing message
 should be an error for your provider.
 
-Note `BODY_LIMIT` (default 1 MiB): base64 inflates a message by about a third,
-so raise it before accepting mail with attachments.
+Note `BODY_LIMIT` (default 30 MB): base64 inflates a message by about a third, so a
+25 MB attachment arrives as ~34 MB of request body.
+
+## Agents
+
+Agents are [VoltAgent](https://voltagent.dev) `Agent` instances used as a library —
+nothing extra listens on port 3141. `hook_id` selects the agent, so
+`POST /webhooks/faktura` runs the agent registered as `faktura`; an unregistered
+hook falls back to `default` and logs that it did. Add one in `src/agents/index.ts`:
+
+```ts
+const agents = new Map<string, Agent>([
+  ["faktura", defineAgent("faktura", "You process supplier invoices. ...")],
+]);
+```
+
+The model is `@ai-sdk/anthropic` with `AGENT_MODEL` (default `claude-opus-5`).
+Pin `@ai-sdk/anthropic` to the 3.x line: 4.x targets a newer AI SDK core than
+VoltAgent 2.x accepts, and the mismatch shows up as a `LanguageModelV4` type error.
+
+Agents are created with `memory: false` on purpose — VoltAgent otherwise provisions
+a local store, which would drop a database file into a service that holds no state.
+
+Without `ANTHROPIC_API_KEY` the pipeline still runs: attachments are converted and
+the assembled input is logged with `agent skipped`. That is the quickest way to see
+what the agent would receive.
 
 ## Auth
 
@@ -116,11 +176,15 @@ the grace period. Override the Node major with `--build-arg NODE_VERSION=24-alpi
 
 ```
 src/
-  server.ts             # listen + graceful shutdown
+  server.ts             # listen + graceful shutdown (drains jobs)
   app.ts                # Fastify instance, logging, error handling
   config.ts             # env parsing
-  ingest.ts             # your handling logic
+  ingest.ts             # orchestrator: parse → 202 → background pipeline
   mail.ts               # base64 → MIME → text / html / attachments
+  docling.ts            # docling-serve client (one document per request)
+  prompt.ts             # email + conversions → agent input
+  jobs.ts               # background runner with drain-on-shutdown
+  agents/index.ts       # VoltAgent agents, keyed by hook_id
   plugins/raw-body.ts   # raw body capture + catch-all content type parser
   routes/
     webhooks.ts         # POST /webhooks/:hook_id

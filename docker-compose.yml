@@ -8,10 +8,18 @@ services:
     environment:
       NODE_ENV: production
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      BODY_LIMIT: ${BODY_LIMIT:-1048576}
+      BODY_LIMIT: ${BODY_LIMIT:-31457280}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
       MAIL_FIELD: ${MAIL_FIELD:-}
       MAIL_ENCODING: ${MAIL_ENCODING:-auto}
+      # Must resolve from inside the container: host.docker.internal or a
+      # service name on a shared network — never localhost.
+      DOCLING_URL: ${DOCLING_URL:-}
+      DOCLING_API_KEY: ${DOCLING_API_KEY:-}
+      DOCLING_TIMEOUT_MS: ${DOCLING_TIMEOUT_MS:-120000}
+      MAX_ATTACHMENT_BYTES: ${MAX_ATTACHMENT_BYTES:-26214400}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_MODEL: ${AGENT_MODEL:-claude-opus-5}
     healthcheck:
       test:
         - CMD
