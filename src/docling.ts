@@ -8,7 +8,8 @@ export interface ConvertRequest {
 
 export type Conversion =
   | { ok: true; filename: string; markdown: string }
-  | { ok: false; filename: string; reason: string };
+  /** `retryable`: a later attempt may succeed (timeout, 5xx/429, network). */
+  | { ok: false; filename: string; reason: string; retryable: boolean };
 
 /** Shape of a docling-serve /v1/convert/source response (the parts we read). */
 interface DoclingResponse {
@@ -28,6 +29,19 @@ function describe(error: unknown): string {
       : error.message;
   }
   return String(error);
+}
+
+/**
+ * Timeouts and 5xx/429 are transient; so is a refused connection, which fetch
+ * reports as a TypeError. A 4xx or docling's own status=failure is not.
+ */
+function isRetryable(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.name === "RetryableError" ||
+    error.name === "TimeoutError" ||
+    error instanceof TypeError
+  );
 }
 
 async function postOnce(request: ConvertRequest): Promise<string> {
@@ -94,6 +108,7 @@ export async function convertToMarkdown(
       ok: false,
       filename: request.filename,
       reason: "DOCLING_URL is not configured",
+      retryable: false,
     };
   }
   if (request.content.byteLength > config.maxAttachmentBytes) {
@@ -101,6 +116,7 @@ export async function convertToMarkdown(
       ok: false,
       filename: request.filename,
       reason: `too large (${request.content.byteLength} bytes > MAX_ATTACHMENT_BYTES)`,
+      retryable: false,
     };
   }
 
@@ -112,21 +128,20 @@ export async function convertToMarkdown(
         markdown: await postOnce(request),
       };
     } catch (error) {
-      const retryable =
-        error instanceof Error &&
-        (error.name === "RetryableError" || error.name === "TimeoutError");
+      const retryable = isRetryable(error);
       if (!retryable || attempt === 2) {
         return {
           ok: false,
           filename: request.filename,
           reason: describe(error),
+          retryable,
         };
       }
       await new Promise((resolve) => setTimeout(resolve, 1_000));
     }
   }
   /* c8 ignore next */
-  return { ok: false, filename: request.filename, reason: "unreachable" };
+  return { ok: false, filename: request.filename, reason: "unreachable", retryable: false };
 }
 
 /** Converts a batch with bounded concurrency, preserving input order. */

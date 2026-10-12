@@ -72,7 +72,19 @@ export const config = {
   agentInstructions: process.env.AGENT_INSTRUCTIONS ?? DEFAULT_INSTRUCTIONS,
   /** Present = the provider can authenticate. Read by the SDK itself. */
   anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-  /** How long shutdown waits for in-flight background jobs. */
+
+  /** Redis backing the ingest queue. Needs persistence and `noeviction`. */
+  redisUrl: process.env.REDIS_URL ?? "redis://localhost:6379",
+  /** How many mails one process works on at once. */
+  queueConcurrency: int(process.env.QUEUE_CONCURRENCY, 1),
+  /** Total tries per mail, the first included, before the job is marked failed. */
+  queueAttempts: int(process.env.QUEUE_ATTEMPTS, 5),
+  /** How long a Message-ID is remembered for dedupe, in seconds (default 7 days). */
+  dedupeTtlS: int(process.env.DEDUPE_TTL_S, 604_800),
+  /**
+   * How long shutdown waits for the mail in progress. Past this the worker is
+   * force-closed and the job is picked up again on the next start.
+   */
   jobDrainTimeoutMs: int(process.env.JOB_DRAIN_TIMEOUT_MS, 30_000),
 } as const;
 

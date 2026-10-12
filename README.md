@@ -7,6 +7,7 @@ Fastify + TypeScript boilerplate for receiving webhooks on `POST /webhooks/:hook
 ```bash
 npm install
 cp .env.example .env
+docker compose up -d redis   # or any local Redis on :6379
 npm run dev
 ```
 
@@ -30,26 +31,50 @@ curl -i -X POST localhost:3000/webhooks/my-source \
 ```
 POST /webhooks/:hook_id
   → parse MIME
-  → dedupe on Message-ID
-  → 202 Accepted                      ← the request ends here, in ~40 ms
-       ↓  (background job)
+  → dedupe on Message-ID (Redis)
+  → enqueue raw MIME (BullMQ)
+  → 202 Accepted                      ← the request ends here
+       ↓  (worker, QUEUE_CONCURRENCY mails at a time)
   → each attachment → Docling → Markdown
   → assemble headers + body + attachment sections
   → agent = agents[hook_id] ?? default
   → agent.generateText(...)
 ```
 
-Everything after the `202` runs in a background job (`src/jobs.ts`), so a slow OCR
-pass or a long agent turn can never cause a provider webhook timeout — and a
-`SIGTERM` waits for in-flight jobs instead of killing them mid-conversion.
+Everything after the `202` runs from a queue (`src/queue.ts`), so a slow OCR pass
+or a long agent turn can never cause a provider webhook timeout.
 
 `src/ingest.ts` is the orchestrator; the steps live in `src/docling.ts`,
 `src/prompt.ts` and `src/agents/index.ts`.
 
-Duplicate deliveries are dropped on `Message-ID` (providers retry on any non-2xx
-and on timeouts), answering `202` with `duplicate: true` and running nothing. The
-set is per-process and resets on restart — the honest limit of a service that
-stores nothing.
+Duplicate deliveries are dropped on `Message-ID` per `hook_id` (providers retry on
+any non-2xx and on timeouts), answering `202` with `duplicate: true` and running
+nothing. Message-IDs are remembered in Redis for `DEDUPE_TTL_S` (7 days), across
+restarts.
+
+## Queue
+
+Mail is queued in Redis with [BullMQ](https://docs.bullmq.io/) before the `202`
+goes out, so it survives restarts, crashes and deploys.
+
+- **Payload** is the raw MIME (base64). The worker re-parses it. Completed jobs are
+  deleted right away; failed ones are kept for 7 days for inspection.
+- **Bursts queue up.** A process works on `QUEUE_CONCURRENCY` mails at a time
+  (default 1). Peak Docling load is `QUEUE_CONCURRENCY × DOCLING_CONCURRENCY`
+  requests, so size them against what docling-serve can handle.
+- **Retries.** A mail gets `QUEUE_ATTEMPTS` tries (default 5) with exponential
+  backoff from 30 s. An agent error retries the job. So does an attachment that
+  failed *transiently* (timeout, `5xx`/`429`, Docling unreachable), so the agent
+  doesn't run on half a mail. On the final attempt the agent runs anyway and the
+  prompt names the documents that could not be read. Permanent conversion failures
+  (too large, Docling `status: failure`) never retry.
+- **Shutdown** stops taking requests, then waits up to `JOB_DRAIN_TIMEOUT_MS` for the
+  mail in progress. If the process dies or the wait runs out, the job's lock lapses
+  and BullMQ runs it again on the next start. Note that this reruns the agent.
+- **Redis unavailable** → the webhook answers `503`, so the provider redelivers.
+- **Redis must persist and never evict.** Run it with `appendonly yes` and
+  `maxmemory-policy noeviction`, as `docker-compose.yml` does. Without these,
+  queued mail can be lost.
 
 ## Document conversion
 
@@ -64,7 +89,8 @@ pipeline has to refuse.
 - **Failures are per-attachment.** A timeout, a `500`, an unreachable Docling, or a
   `200` carrying `status: "failure"` marks that one document as failed and notes it
   in the agent's input; the rest of the message still goes through. `5xx` and
-  timeouts get one retry.
+  timeouts get one quick retry. After that the whole job is retried later (see
+  [Queue](#queue)).
 - **Oversized attachments** (`MAX_ATTACHMENT_BYTES`, default 25 MB) are skipped
   without a Docling call and mentioned in the input.
 - **HTML-only messages** have their body converted too — Docling accepts HTML, which
@@ -72,12 +98,12 @@ pipeline has to refuse.
 
 ## Mail parsing
 
-`ingest()` runs the payload through `parseEmailFromWebhook()` (`src/mail.ts`),
-which finds the raw message, base64-decodes it when needed, and parses the MIME
+`ingest()` runs the payload through `extractMime()` (`src/mail.ts`), which finds
+the raw message and base64-decodes it when needed. `parseMime()` then parses it
 with [mailparser](https://nodemailer.com/extras/mailparser/):
 
 ```ts
-const email = await parseEmailFromWebhook(event);
+const email = await parseMime(extractMime(event)!);
 email.subject;      // encoded words already decoded → "Faktura för augusti"
 email.from;         // [{ name: "Ada Lovelace", address: "ada@example.com" }]
 email.to;           // same shape; also .cc, .replyTo
@@ -177,7 +203,8 @@ docker build -t ingester-template .
 docker run -p 3000:3000 -e WEBHOOK_SECRET=... ingester-template
 ```
 
-Or with Compose (reads `.env` for `PORT`, `WEBHOOK_SECRET`, `LOG_LEVEL`, `BODY_LIMIT`):
+Or with Compose, which also starts a persistent Redis for the queue (reads `.env`
+for `PORT`, `WEBHOOK_SECRET`, `LOG_LEVEL`, `BODY_LIMIT`, …):
 
 ```bash
 docker compose up --build -d
@@ -191,21 +218,22 @@ unprivileged `node` user, defaults to `NODE_ENV=production` on `0.0.0.0:3000`,
 and has a `HEALTHCHECK` against `/health`.
 
 `node` runs as PID 1 — `src/server.ts` traps `SIGTERM`/`SIGINT` and closes the
-server, so `docker stop` drains in-flight requests instead of being killed after
-the grace period. Override the Node major with `--build-arg NODE_VERSION=24-alpine`.
+server, then waits for the mail in progress (`JOB_DRAIN_TIMEOUT_MS`). Keep
+`docker stop`'s grace period longer than that (Compose sets `stop_grace_period: 40s`;
+plain `docker stop` defaults to 10 s), or the job is cut off and rerun on the next start. Override the Node major with `--build-arg NODE_VERSION=24-alpine`.
 
 ## Layout
 
 ```
 src/
-  server.ts             # listen + graceful shutdown (drains jobs)
+  server.ts             # starts the worker, listen + graceful shutdown
   app.ts                # Fastify instance, logging, error handling
   config.ts             # env parsing
-  ingest.ts             # orchestrator: parse → 202 → background pipeline
+  ingest.ts             # orchestrator: parse → enqueue → 202; worker pipeline
   mail.ts               # base64 → MIME → text / html / attachments
   docling.ts            # docling-serve client (one document per request)
   prompt.ts             # email + conversions → agent input
-  jobs.ts               # background runner with drain-on-shutdown
+  queue.ts              # BullMQ queue + worker, Redis dedupe
   mcp.ts                # MCP client: remote tools for the agents
   agents/index.ts       # VoltAgent agents, keyed by hook_id
   plugins/raw-body.ts   # raw body capture + catch-all content type parser

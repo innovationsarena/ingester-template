@@ -3,8 +3,13 @@ services:
     build: .
     image: ingester-template
     restart: unless-stopped
+    # Longer than JOB_DRAIN_TIMEOUT_MS, so shutdown can finish the mail in progress.
+    stop_grace_period: 40s
     ports:
       - "${PORT:-3000}:3000"
+    depends_on:
+      redis:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -22,6 +27,11 @@ services:
       MCP_TIMEOUT_MS: ${MCP_TIMEOUT_MS:-30000}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       AGENT_MODEL: ${AGENT_MODEL:-claude-opus-5}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      QUEUE_CONCURRENCY: ${QUEUE_CONCURRENCY:-1}
+      QUEUE_ATTEMPTS: ${QUEUE_ATTEMPTS:-5}
+      DEDUPE_TTL_S: ${DEDUPE_TTL_S:-604800}
+      JOB_DRAIN_TIMEOUT_MS: ${JOB_DRAIN_TIMEOUT_MS:-30000}
     healthcheck:
       test:
         - CMD
@@ -32,3 +42,20 @@ services:
       timeout: 3s
       start_period: 5s
       retries: 3
+
+  # Holds the ingest queue. AOF persistence is what lets queued mail survive a
+  # restart; BullMQ requires noeviction, or Redis may silently drop jobs.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  redis-data:

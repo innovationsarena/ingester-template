@@ -1,10 +1,17 @@
+import type { Job } from "bullmq";
 import type { FastifyBaseLogger } from "fastify";
 
 import { agentsEnabled, selectAgent } from "./agents/index.js";
 import { convertAll, convertToMarkdown, type ConvertRequest, type Conversion } from "./docling.js";
-import * as jobs from "./jobs.js";
-import { parseEmailFromWebhook, type Email } from "./mail.js";
+import { extractMime, parseMime, type Email } from "./mail.js";
 import { buildAgentInput } from "./prompt.js";
+import {
+  enqueue,
+  forgetDelivery,
+  isLastAttempt,
+  markFirstDelivery,
+  type IngestJob,
+} from "./queue.js";
 
 export interface WebhookEvent {
   /** The `:hook_id` path segment the payload arrived on. */
@@ -59,27 +66,23 @@ function filenameFor(attachment: Email["attachments"][number], index: number): s
   return `attachment-${index + 1}.${extension}`;
 }
 
-/**
- * Per-process dedupe on Message-ID. Providers retry on any non-2xx and on
- * timeouts, and a retried delivery must not trigger a second agent run. This
- * resets on restart — the honest ceiling of a storage-free design.
- */
-const DEDUPE_LIMIT = 1_000;
-const seenMessages = new Set<string>();
-
-function firstDelivery(messageId: string | undefined): boolean {
-  if (!messageId) return true;
-  if (seenMessages.has(messageId)) return false;
-  seenMessages.add(messageId);
-  if (seenMessages.size > DEDUPE_LIMIT) {
-    const oldest = seenMessages.values().next().value;
-    if (oldest !== undefined) seenMessages.delete(oldest);
-  }
-  return true;
+/** Rejects the webhook with 503 so the provider redelivers later. */
+function unavailable(cause: unknown): Error {
+  const error = new Error("queue unavailable", { cause });
+  (error as Error & { statusCode: number }).statusCode = 503;
+  return error;
 }
 
-/** The pipeline itself: convert every attachment, then hand the lot to an agent. */
-async function process(email: Email, hookId: string, log: FastifyBaseLogger): Promise<void> {
+/**
+ * The pipeline itself: convert every attachment, then hand the lot to an agent.
+ * Throwing fails the attempt and BullMQ retries it with backoff.
+ */
+async function process(
+  email: Email,
+  hookId: string,
+  lastAttempt: boolean,
+  log: FastifyBaseLogger,
+): Promise<void> {
   const requests: ConvertRequest[] = email.attachments.map((attachment, index) => ({
     filename: filenameFor(attachment, index),
     contentType: attachment.contentType,
@@ -99,6 +102,18 @@ async function process(email: Email, hookId: string, log: FastifyBaseLogger): Pr
         "attachment conversion failed",
       );
     }
+  }
+
+  // A docling timeout or overload shouldn't leave the agent with half a mail:
+  // retry the whole job later. The last attempt goes ahead with what it has,
+  // and the prompt names the documents that could not be read.
+  const transient = conversions.filter((c) => !c.ok && c.retryable);
+  if (transient.length > 0 && !lastAttempt) {
+    throw new Error(
+      `${transient.length} of ${conversions.length} attachment(s) failed transiently: ${transient
+        .map((c) => c.filename)
+        .join(", ")}`,
+    );
   }
 
   // An HTML-only message has no plain-text part; Docling accepts HTML as input,
@@ -144,11 +159,21 @@ async function process(email: Email, hookId: string, log: FastifyBaseLogger): Pr
   log.debug({ hookId, agent: name, text: result.text }, "agent response");
 }
 
+/** Worker side: one queued mail, re-parsed from its MIME. */
+export async function processJob(job: Job<IngestJob>, log: FastifyBaseLogger): Promise<void> {
+  const { hookId, requestId } = job.data;
+  const jobLog = log.child({ jobId: job.id, hookId, requestId, attempt: job.attemptsMade + 1 });
+  const email = await parseMime(Buffer.from(job.data.mime, "base64"));
+  jobLog.info({ messageId: email.messageId, subject: email.subject }, "ingest job started");
+  await process(email, hookId, isLastAttempt(job), jobLog);
+}
+
 /**
  * Single entry point for everything that arrives on /webhooks/:hook_id.
  *
- * Parses the message, then hands the pipeline to a background job so the route
- * can answer 202 immediately. Anything slow belongs inside `process`, not here.
+ * Parses the message for logging and dedupe, then puts the raw MIME on the
+ * queue so the route can answer 202 immediately. Once enqueued, the mail
+ * survives restarts. Anything slow belongs inside `process`, not here.
  */
 export async function ingest(
   event: WebhookEvent,
@@ -156,12 +181,14 @@ export async function ingest(
 ): Promise<IngestResult> {
   log.info({ hookId: event.hookId, bytes: event.raw.length }, "webhook received");
 
-  const email = await parseEmailFromWebhook(event);
+  const mime = extractMime(event);
 
-  if (!email) {
+  if (!mime) {
     log.warn({ hookId: event.hookId }, "no MIME message found in payload");
     return { accepted: true, hookId: event.hookId, parsed: false };
   }
+
+  const email = await parseMime(mime);
 
   log.info(
     {
@@ -184,24 +211,45 @@ export async function ingest(
   // Untruncated bodies — run with LOG_LEVEL=debug to see them in full.
   log.debug({ hookId: event.hookId, text: email.text, html: email.html }, "email bodies");
 
-  if (!firstDelivery(email.messageId)) {
-    log.info({ hookId: event.hookId, messageId: email.messageId }, "duplicate delivery ignored");
+  const { messageId } = email;
+  let first: boolean;
+  try {
+    first = messageId ? await markFirstDelivery(event.hookId, messageId) : true;
+  } catch (err) {
+    throw unavailable(err);
+  }
+
+  if (!first) {
+    log.info({ hookId: event.hookId, messageId }, "duplicate delivery ignored");
     return {
       accepted: true,
       hookId: event.hookId,
       parsed: true,
       duplicate: true,
-      messageId: email.messageId,
+      messageId,
     };
   }
 
-  jobs.run(`ingest:${event.hookId}`, log, () => process(email, event.hookId, log));
+  let jobId: string | undefined;
+  try {
+    jobId = await enqueue({
+      hookId: event.hookId,
+      requestId: event.requestId,
+      mime: mime.toString("base64"),
+    });
+  } catch (err) {
+    if (messageId) await forgetDelivery(event.hookId, messageId).catch(() => undefined);
+    throw unavailable(err);
+  }
+
+  log.info({ hookId: event.hookId, messageId, jobId }, "email queued");
 
   return {
     accepted: true,
     hookId: event.hookId,
     parsed: true,
-    messageId: email.messageId,
+    messageId,
+    jobId,
     subject: email.subject,
     attachments: email.attachments.length,
   };

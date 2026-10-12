@@ -172,16 +172,12 @@ export async function parseMime(mime: Buffer): Promise<Email> {
 }
 
 /**
- * Pulls the raw message out of a webhook payload (base64 or plain MIME) and
- * parses it. Returns undefined when the payload carries no message — the caller
+ * Pulls the raw message out of a webhook payload (base64 or plain MIME) as MIME
+ * bytes. Returns undefined when the payload carries no message — the caller
  * decides whether that is an error.
  */
-export async function parseEmailFromWebhook(event: WebhookEvent): Promise<Email | undefined> {
+export function extractMime(event: WebhookEvent): Buffer | undefined {
   const candidate = findCandidate(event);
   if (!candidate) return undefined;
-
-  const mime = toMimeBuffer(candidate);
-  if (!mime) return undefined;
-
-  return parseMime(mime);
+  return toMimeBuffer(candidate);
 }

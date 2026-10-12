@@ -15,8 +15,10 @@
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.116",
     "@voltagent/core": "^2.10.0",
+    "bullmq": "^6.3.12",
     "fastify": "^5.2.1",
     "fastify-plugin": "^5.0.1",
+    "ioredis": "^6.0.0",
     "mailparser": "^3.9.20"
   },
   "devDependencies": {
