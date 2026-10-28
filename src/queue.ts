@@ -56,8 +56,18 @@ export function startQueue(log: FastifyBaseLogger, processor: IngestProcessor): 
     concurrency: config.queueConcurrency,
   });
 
+  log.info(
+    { queue: QUEUE_NAME, concurrency: config.queueConcurrency, attempts: config.queueAttempts },
+    "queue started",
+  );
+
   queue.on("error", (err) => log.error({ err }, "queue redis error"));
   worker.on("error", (err) => log.error({ err }, "worker redis error"));
+  worker.on("ready", () => log.info("worker connected to redis"));
+  worker.on("active", (job) =>
+    log.debug({ jobId: job.id, hookId: job.data.hookId, requestId: job.data.requestId }, "job picked up"),
+  );
+  worker.on("completed", (job) => log.debug({ jobId: job.id }, "job removed"));
   worker.on("failed", (job, err) => {
     if (!job) return;
     const final = job.attemptsMade >= (job.opts.attempts ?? 1);
@@ -69,6 +79,8 @@ export function startQueue(log: FastifyBaseLogger, processor: IngestProcessor): 
         requestId: job.data.requestId,
         attempt: job.attemptsMade,
         attempts: job.opts.attempts,
+        // Mirrors the exponential backoff configured above.
+        ...(final ? {} : { nextRetryInMs: 30_000 * 2 ** (job.attemptsMade - 1) }),
       },
       final ? "ingest job failed, giving up" : "ingest job failed, will retry",
     );

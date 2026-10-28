@@ -1,9 +1,11 @@
 import type { Job } from "bullmq";
 import type { FastifyBaseLogger } from "fastify";
 
-import { agentsEnabled, selectAgent } from "./agents/index.js";
+import { agentLogHooks, agentsEnabled, selectAgent } from "./agents/index.js";
+import { config } from "./config.js";
 import { convertAll, convertToMarkdown, type ConvertRequest, type Conversion } from "./docling.js";
 import { extractMime, parseMime, type Email } from "./mail.js";
+import { logMcpTools } from "./mcp.js";
 import { buildAgentInput } from "./prompt.js";
 import {
   enqueue,
@@ -89,7 +91,16 @@ async function process(
     content: attachment.content,
   }));
 
-  const conversions: Conversion[] = requests.length > 0 ? await convertAll(requests) : [];
+  if (requests.length > 0) {
+    log.info(
+      { count: requests.length, files: requests.map((r) => r.filename) },
+      "converting attachments",
+    );
+  } else {
+    log.info("no attachments");
+  }
+
+  const conversions: Conversion[] = requests.length > 0 ? await convertAll(requests, log) : [];
   for (const conversion of conversions) {
     if (conversion.ok) {
       log.info(
@@ -108,7 +119,22 @@ async function process(
   // retry the whole job later. The last attempt goes ahead with what it has,
   // and the prompt names the documents that could not be read.
   const transient = conversions.filter((c) => !c.ok && c.retryable);
+  if (conversions.length > 0) {
+    log.info(
+      {
+        ok: conversions.filter((c) => c.ok).length,
+        failed: conversions.filter((c) => !c.ok).length,
+        transient: transient.length,
+      },
+      "attachments converted",
+    );
+  }
+  const transientFiles = transient.map((c) => c.filename);
+  if (transient.length > 0 && lastAttempt) {
+    log.warn({ files: transientFiles }, "last attempt, continuing with unreadable attachments");
+  }
   if (transient.length > 0 && !lastAttempt) {
+    log.warn({ files: transientFiles }, "transient conversion failures, retrying job");
     throw new Error(
       `${transient.length} of ${conversions.length} attachment(s) failed transiently: ${transient
         .map((c) => c.filename)
@@ -120,20 +146,32 @@ async function process(
   // so convert it rather than shipping raw markup to the model.
   let body = email;
   if (!email.text && email.html) {
-    const converted = await convertToMarkdown({
-      filename: "message-body.html",
-      contentType: "text/html",
-      content: Buffer.from(email.html, "utf8"),
-    });
-    if (converted.ok) body = { ...email, text: converted.markdown };
-    else log.warn({ reason: converted.reason }, "html body conversion failed");
+    log.info({ chars: email.html.length }, "converting html body");
+    const converted = await convertToMarkdown(
+      {
+        filename: "message-body.html",
+        contentType: "text/html",
+        content: Buffer.from(email.html, "utf8"),
+      },
+      log,
+    );
+    if (converted.ok) {
+      body = { ...email, text: converted.markdown };
+      log.info({ chars: converted.markdown.length }, "html body converted");
+    } else {
+      log.warn({ reason: converted.reason }, "html body conversion failed");
+    }
+  } else if (email.html) {
+    log.debug("plain-text body present, html not converted");
   }
 
   const input = buildAgentInput(body, conversions);
+  log.info({ chars: input.length, attachments: conversions.length }, "agent input built");
+  log.debug({ input }, "agent input");
 
   // Resolved before the credential check so routing stays observable without a key.
   const { agent, name, fellBack } = selectAgent(hookId);
-  if (fellBack) log.info({ hookId, agent: name }, "no agent for hook, using default");
+  log.info({ hookId, agent: name, fellBack }, "agent selected");
 
   if (!agentsEnabled) {
     log.warn(
@@ -143,7 +181,16 @@ async function process(
     return;
   }
 
-  const result = await agent.generateText(input);
+  await logMcpTools(log);
+  log.info({ agent: name, model: config.agentModel }, "agent started");
+
+  let result: Awaited<ReturnType<typeof agent.generateText>>;
+  try {
+    result = await agent.generateText(input, { hooks: agentLogHooks(log) });
+  } catch (err) {
+    log.error({ err, agent: name }, "agent failed");
+    throw err;
+  }
 
   log.info(
     {
@@ -163,9 +210,21 @@ async function process(
 export async function processJob(job: Job<IngestJob>, log: FastifyBaseLogger): Promise<void> {
   const { hookId, requestId } = job.data;
   const jobLog = log.child({ jobId: job.id, hookId, requestId, attempt: job.attemptsMade + 1 });
-  const email = await parseMime(Buffer.from(job.data.mime, "base64"));
-  jobLog.info({ messageId: email.messageId, subject: email.subject }, "ingest job started");
+  const started = Date.now();
+  jobLog.info("ingest job started");
+  const mime = Buffer.from(job.data.mime, "base64");
+  const email = await parseMime(mime);
+  jobLog.info(
+    {
+      messageId: email.messageId,
+      subject: email.subject,
+      bytes: mime.length,
+      attachments: email.attachments.length,
+    },
+    "mime re-parsed",
+  );
   await process(email, hookId, isLastAttempt(job), jobLog);
+  jobLog.info({ durationMs: Date.now() - started }, "ingest job completed");
 }
 
 /**
@@ -181,7 +240,7 @@ export async function ingest(
 ): Promise<IngestResult> {
   log.info({ hookId: event.hookId, bytes: event.raw.length }, "webhook received");
 
-  const mime = extractMime(event);
+  const mime = extractMime(event, log);
 
   if (!mime) {
     log.warn({ hookId: event.hookId }, "no MIME message found in payload");
@@ -216,8 +275,12 @@ export async function ingest(
   try {
     first = messageId ? await markFirstDelivery(event.hookId, messageId) : true;
   } catch (err) {
+    log.error({ err, hookId: event.hookId }, "dedupe check failed, answering 503");
     throw unavailable(err);
   }
+
+  if (!messageId) log.warn({ hookId: event.hookId }, "no Message-ID, dedupe skipped");
+  else if (first) log.info({ hookId: event.hookId, messageId }, "first delivery");
 
   if (!first) {
     log.info({ hookId: event.hookId, messageId }, "duplicate delivery ignored");
@@ -238,6 +301,7 @@ export async function ingest(
       mime: mime.toString("base64"),
     });
   } catch (err) {
+    log.error({ err, hookId: event.hookId }, "enqueue failed, answering 503");
     if (messageId) await forgetDelivery(event.hookId, messageId).catch(() => undefined);
     throw unavailable(err);
   }

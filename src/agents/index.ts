@@ -1,5 +1,6 @@
 import { anthropic } from "@ai-sdk/anthropic";
-import { Agent } from "@voltagent/core";
+import { Agent, type AgentHooks } from "@voltagent/core";
+import type { FastifyBaseLogger } from "fastify";
 
 import { config } from "../config.js";
 import { mcpTools } from "../mcp.js";
@@ -41,6 +42,36 @@ export function selectAgent(hookId: string): AgentSelection {
   const agent = agents.get(hookId);
   if (agent) return { agent, name: hookId, fellBack: false };
   return { agent: fallback, name: "default", fellBack: true };
+}
+
+/**
+ * Per-run hooks that put the agent's tool calls in the job's log. Passed to
+ * `generateText` rather than baked into the agent so each line carries the
+ * job's jobId/hookId/requestId.
+ */
+export function agentLogHooks(log: FastifyBaseLogger): AgentHooks {
+  return {
+    onToolStart: ({ tool, args }) => {
+      log.info({ tool: tool.name }, "tool call started");
+      log.debug({ tool: tool.name, args }, "tool call args");
+    },
+    onToolEnd: ({ tool, output, error }) => {
+      log.info({ tool: tool.name, ok: !error }, "tool call finished");
+      log.debug({ tool: tool.name, output }, "tool call output");
+      // undefined = keep the tool's output as is.
+      return undefined;
+    },
+    onToolError: ({ tool, originalError }) => {
+      log.warn({ tool: tool.name, err: originalError }, "tool call failed");
+      return undefined;
+    },
+    onStepFinish: () => {
+      log.debug("agent step finished");
+    },
+    onRetry: ({ source }) => {
+      log.warn({ source }, "agent retrying model call");
+    },
+  };
 }
 
 /** False when no credentials are configured, so the pipeline can skip the call. */

@@ -1,4 +1,5 @@
 import { MCPConfiguration } from "@voltagent/core";
+import type { FastifyBaseLogger } from "fastify";
 
 import { config } from "./config.js";
 
@@ -37,6 +38,20 @@ const mcp = config.mcpUrl
  * is still processed, just without the tools.
  */
 export const mcpTools = async (): Promise<McpTools> => (mcp ? mcp.getTools() : []);
+
+/**
+ * Logs which MCP tools the next agent run will get. Kept apart from `mcpTools`,
+ * which VoltAgent calls with its own arguments. Cheap: the client is cached.
+ */
+export async function logMcpTools(log: FastifyBaseLogger): Promise<void> {
+  if (!mcp) {
+    log.info("mcp disabled (MCP_URL empty)");
+    return;
+  }
+  const tools = await mcpTools();
+  if (tools.length === 0) log.warn("no mcp tools available");
+  else log.info({ count: tools.length, names: tools.map((t) => t.name) }, "mcp tools loaded");
+}
 
 /** Closes the MCP transports on shutdown. */
 export async function disconnectMcp(): Promise<void> {

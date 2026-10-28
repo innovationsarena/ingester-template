@@ -46,6 +46,10 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
             config.webhookSecret
           )
         ) {
+          request.log.warn(
+            { hookId: (request.params as Partial<WebhookParams>).hook_id },
+            "webhook rejected: bad or missing secret"
+          );
           return reply.code(401).send({ error: "unauthorized" });
         }
       },

@@ -1,3 +1,4 @@
+import type { FastifyBaseLogger } from "fastify";
 import { simpleParser, type AddressObject, type ParsedMail } from "mailparser";
 
 import { config } from "./config.js";
@@ -68,26 +69,32 @@ function getPath(source: unknown, path: string): unknown {
   }, source);
 }
 
+interface Candidate {
+  value: string;
+  /** Where it was found, for the logs: `MAIL_FIELD:<path>`, `body-string`, `field:<name>` or `raw`. */
+  source: string;
+}
+
 /** Locates the raw message inside the webhook payload. */
-function findCandidate(event: WebhookEvent): string | undefined {
+function findCandidate(event: WebhookEvent): Candidate | undefined {
   // Explicit wins: MAIL_FIELD may be a dot path, e.g. "envelope.message.raw".
   if (config.mailField) {
     const value = getPath(event.body, config.mailField);
-    return typeof value === "string" ? value : undefined;
+    return typeof value === "string" ? { value, source: `MAIL_FIELD:${config.mailField}` } : undefined;
   }
 
-  if (typeof event.body === "string") return event.body;
+  if (typeof event.body === "string") return { value: event.body, source: "body-string" };
 
   if (event.body !== null && typeof event.body === "object") {
     for (const field of DEFAULT_FIELDS) {
       const value = (event.body as Record<string, unknown>)[field];
-      if (typeof value === "string" && value.length > 0) return value;
+      if (typeof value === "string" && value.length > 0) return { value, source: `field:${field}` };
     }
     return undefined;
   }
 
   // No parsed body to inspect (e.g. an unknown content type) — try the raw text.
-  return event.raw.length > 0 ? event.raw : undefined;
+  return event.raw.length > 0 ? { value: event.raw, source: "raw" } : undefined;
 }
 
 function looksLikeMime(value: string): boolean {
@@ -98,13 +105,13 @@ function looksLikeMime(value: string): boolean {
  * Turns the candidate into MIME bytes. Handles base64 and base64url, tolerates
  * the line wrapping that transports insert, and passes plain MIME through.
  */
-function toMimeBuffer(candidate: string): Buffer | undefined {
+function toMimeBuffer(candidate: string): { mime: Buffer; encoding: "plain" | "base64" } | undefined {
   const encoding = config.mailEncoding;
 
   if (encoding !== "base64" && looksLikeMime(candidate)) {
-    return Buffer.from(candidate, "utf8");
+    return { mime: Buffer.from(candidate, "utf8"), encoding: "plain" };
   }
-  if (encoding === "utf8") return Buffer.from(candidate, "utf8");
+  if (encoding === "utf8") return { mime: Buffer.from(candidate, "utf8"), encoding: "plain" };
 
   const compact = candidate.replace(/\s+/g, "");
   if (compact.length === 0 || !BASE64_RE.test(compact)) return undefined;
@@ -117,7 +124,7 @@ function toMimeBuffer(candidate: string): Buffer | undefined {
   if (encoding === "auto" && !looksLikeMime(decoded.subarray(0, 256).toString("utf8"))) {
     return undefined;
   }
-  return decoded;
+  return { mime: decoded, encoding: "base64" };
 }
 
 function addresses(value: AddressObject | AddressObject[] | undefined): MailAddress[] {
@@ -176,8 +183,19 @@ export async function parseMime(mime: Buffer): Promise<Email> {
  * bytes. Returns undefined when the payload carries no message — the caller
  * decides whether that is an error.
  */
-export function extractMime(event: WebhookEvent): Buffer | undefined {
+export function extractMime(event: WebhookEvent, log?: FastifyBaseLogger): Buffer | undefined {
   const candidate = findCandidate(event);
   if (!candidate) return undefined;
-  return toMimeBuffer(candidate);
+  log?.debug({ source: candidate.source, chars: candidate.value.length }, "mime candidate found");
+
+  const result = toMimeBuffer(candidate.value);
+  if (!result) {
+    log?.warn({ source: candidate.source }, "mime candidate not decodable");
+    return undefined;
+  }
+  log?.info(
+    { source: candidate.source, encoding: result.encoding, bytes: result.mime.length },
+    "mime extracted",
+  );
+  return result.mime;
 }

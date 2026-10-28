@@ -1,3 +1,5 @@
+import type { FastifyBaseLogger } from "fastify";
+
 import { config } from "./config.js";
 
 export interface ConvertRequest {
@@ -101,7 +103,8 @@ async function postOnce(request: ConvertRequest): Promise<string> {
 
 /** Converts one document to Markdown. Never throws — failures come back as data. */
 export async function convertToMarkdown(
-  request: ConvertRequest
+  request: ConvertRequest,
+  log?: FastifyBaseLogger
 ): Promise<Conversion> {
   if (!config.doclingUrl) {
     return {
@@ -121,12 +124,23 @@ export async function convertToMarkdown(
   }
 
   for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      return {
-        ok: true,
+    log?.debug(
+      {
         filename: request.filename,
-        markdown: await postOnce(request),
-      };
+        contentType: request.contentType,
+        bytes: request.content.byteLength,
+        attempt,
+      },
+      "docling request"
+    );
+    const started = Date.now();
+    try {
+      const markdown = await postOnce(request);
+      log?.debug(
+        { filename: request.filename, chars: markdown.length, ms: Date.now() - started },
+        "docling response"
+      );
+      return { ok: true, filename: request.filename, markdown };
     } catch (error) {
       const retryable = isRetryable(error);
       if (!retryable || attempt === 2) {
@@ -137,6 +151,10 @@ export async function convertToMarkdown(
           retryable,
         };
       }
+      log?.warn(
+        { filename: request.filename, reason: describe(error) },
+        "docling attempt failed, retrying"
+      );
       await new Promise((resolve) => setTimeout(resolve, 1_000));
     }
   }
@@ -146,7 +164,8 @@ export async function convertToMarkdown(
 
 /** Converts a batch with bounded concurrency, preserving input order. */
 export async function convertAll(
-  requests: ConvertRequest[]
+  requests: ConvertRequest[],
+  log?: FastifyBaseLogger
 ): Promise<Conversion[]> {
   const results: Conversion[] = new Array(requests.length);
   let next = 0;
@@ -155,7 +174,8 @@ export async function convertAll(
     while (next < requests.length) {
       const index = next++;
       results[index] = await convertToMarkdown(
-        requests[index] as ConvertRequest
+        requests[index] as ConvertRequest,
+        log
       );
     }
   };

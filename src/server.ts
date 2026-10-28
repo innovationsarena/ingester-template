@@ -23,9 +23,12 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
       // Stop accepting new requests, then let the mail in progress finish.
       // Anything still queued stays in Redis for the next start.
       await app.close();
+      app.log.info("http closed");
       const drained = await closeQueue(config.jobDrainTimeoutMs);
-      if (!drained) app.log.warn("shutdown timed out; the job in progress will rerun on next start");
+      if (drained) app.log.info("queue drained");
+      else app.log.warn("shutdown timed out; the job in progress will rerun on next start");
       await disconnectMcp();
+      app.log.info("mcp disconnected");
       process.exit(0);
     })();
   });
